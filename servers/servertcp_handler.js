@@ -69,7 +69,7 @@ function _handlePromiseOrValue(promiseOrValue, cb) {
             .catch(function(err) {
                 cb(err);
             });
-    }  else {
+    } else {
         cb(null, promiseOrValue);
     }
 }
@@ -861,6 +861,7 @@ function _handleForceMultipleCoils(requestBuffer, vector, unitID, callback) {
         }
     }
 }
+
 /**
  * Function to handle FC16 request.
  *
@@ -948,6 +949,116 @@ function _handleWriteMultipleRegisters(requestBuffer, vector, unitID, callback) 
                 cb(err);
             }
         }
+    }
+}
+
+/**
+ * Function to handle FC23 request.
+ *
+ * @param requestBuffer - request Buffer from client
+ * @param vector - vector of functions for read and write
+ * @param unitID - Id of the requesting unit
+ * @param {function} callback - callback to be invoked passing {Buffer} response
+ * @returns undefined
+ * @private
+ */
+function _handleWriteAndReadMultipleRegisters(requestBuffer, vector, unitID, callback) {
+    const readAddress = requestBuffer.readUInt16BE(2);
+    const readLength = requestBuffer.readUInt16BE(4);
+    const writeAddress = requestBuffer.readUInt16BE(6);
+    const writeLength = requestBuffer.readUInt16BE(8);
+    const valueSize = 2;
+
+    // if length is bad, ignore message
+    if (requestBuffer.length !== (10 + 1 + writeLength * 2 + 2)) {
+        return;
+    }
+
+    // build answer
+    const responseBuffer = Buffer.alloc(3 + (readLength * valueSize) + 2);
+    responseBuffer.writeUInt8(readLength * valueSize, 2);
+
+    // Write the data first
+    const writeValues = [];
+    for (let i = 0; i < writeLength; i++) {
+        writeValues.push(requestBuffer.readUInt16BE(10 + 1 + i * 2));
+    }
+
+    let callbackInvoked = false;
+
+    const readRegisters = function(err) {
+        if (err) {
+            if (!callbackInvoked) {
+                callbackInvoked = true;
+                callback(err);
+            }
+            return;
+        }
+
+        // Now read the data after write is successful
+        if (vector.getMultipleHoldingRegisters && readLength > 1) {
+            if (vector.getMultipleHoldingRegisters.length === 4) {
+
+                vector.getMultipleHoldingRegisters(readAddress, readLength, unitID, function(err, readValues) {
+                    if (err) {
+                        callback(err);
+                    } else if (readValues.length === readLength) {
+                        for (let j = 0; j < readLength; j++) {
+                            responseBuffer.writeUInt16BE(readValues[j], 3 + (j * valueSize));
+                        }
+                        modbusSerialDebug({ action: "FC23 response", responseBuffer: responseBuffer });
+                        callback(null, responseBuffer);
+                    } else {
+                        callback(new Error("Requested address length and response length do not match"));
+                    }
+                });
+            } else {
+                const promiseOrValue = vector.getMultipleHoldingRegisters(readAddress, readLength, unitID);
+                _handlePromiseOrValue(promiseOrValue, function(err, values) {
+                    if (err) {
+                        callback(err);
+                    }
+                    if (values.length === readLength) {
+                        for (let i = 0; i < readLength; i++) {
+                            responseBuffer.writeUInt16BE(values[i], 3 + (i * valueSize));
+                        }
+                        modbusSerialDebug({ action: "FC23 response", responseBuffer: responseBuffer });
+                        callback(null, responseBuffer);
+                    } else {
+                        const error = new Error("Requested address length and response length do not match");
+                        callback(error);
+                    }
+                });
+            }
+        } else if (vector.getHoldingRegister) {
+            const readValues = [];
+            for (let j = 0; j < readLength; j++) {
+                readValues.push(vector.getHoldingRegister(readAddress + j, unitID));
+            }
+            for (let j = 0; j < readLength; j++) {
+                responseBuffer.writeUInt16BE(readValues[j], 3 + (j * valueSize));
+            }
+
+            modbusSerialDebug({ action: "FC23 response", responseBuffer: responseBuffer });
+            callback(null, responseBuffer);
+        } else {
+            callback(new Error("Reading not supported"));
+        }
+    };
+
+    if (vector.setRegisterArray) {
+        if (vector.setRegisterArray.length === 4) {
+            vector.setRegisterArray(writeAddress, writeValues, unitID, readRegisters);
+        } else {
+            const promiseOrValue = vector.setRegisterArray(writeAddress, writeValues, unitID);
+            _handlePromiseOrValue(promiseOrValue, readRegisters);
+        }
+    } else if (vector.setRegister) {
+        for (let i = 0; i < writeLength; i++) {
+            vector.setRegister(writeAddress + i, writeValues[i], unitID, readRegisters);
+        }
+    } else {
+        callback(new Error("Writing not supported"));
     }
 }
 
@@ -1152,9 +1263,10 @@ function _handleReadDeviceIdentification(requestBuffer, vector, unitID, callback
 
             // Enforcing maximum string length
             if(objects[id].length > stringLengthMax) {
-                callback({ modbusErrorCode: 0x04,
-                    msg: "Read Device Identification string size can be maximum " +
-                                stringLengthMax });
+                callback({
+                    modbusErrorCode: 0x04,
+                    msg: "Read Device Identification string size can be maximum " + stringLengthMax
+                });
             }
 
             if(lastID !== 0)
@@ -1212,6 +1324,7 @@ module.exports = {
     writeSingleRegisterEnron: _handleWriteSingleRegisterEnron,
     forceMultipleCoils: _handleForceMultipleCoils,
     writeMultipleRegisters: _handleWriteMultipleRegisters,
+    writeAndReadMultipleRegisters: _handleWriteAndReadMultipleRegisters,
     reportServerID: _handleReportServerID,
     handleMEI: _handleMEI
 };
